@@ -1,0 +1,42 @@
+name: SPY alerts
+
+# GitHub cron is in UTC. Each job is listed twice (winter EST + summer EDT);
+# the script exits unless it lands in its New York time window.
+on:
+  schedule:
+    - cron: "20 12 * * 1-5"   # morning (8:20 ET in summer)
+    - cron: "20 13 * * 1-5"   # morning (8:20 ET in winter)
+    - cron: "5 16 * * 1-5"    # afternoon (12:05 ET in summer)
+    - cron: "5 17 * * 1-5"    # afternoon (12:05 ET in winter)
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: "test / morning / afternoon"
+        default: "test"
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    timeout-minutes: 340
+    concurrency:
+      group: spy-${{ github.event.schedule == '5 16 * * 1-5' && 'pm' || github.event.schedule == '5 17 * * 1-5' && 'pm' || 'am' }}
+      cancel-in-progress: false
+    env:
+      TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+      TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+      ALPACA_KEY_ID: ${{ secrets.ALPACA_KEY_ID }}
+      ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
+      FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r requirements.txt
+      - name: Pick mode
+        id: m
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "mode=${{ inputs.mode }}" >> $GITHUB_OUTPUT;
+          elif [[ "${{ github.event.schedule }}" == 5\ 1* ]]; then echo "mode=afternoon" >> $GITHUB_OUTPUT;
+          else echo "mode=morning" >> $GITHUB_OUTPUT; fi
+      - run: python -u spy_live_agent.py ${{ steps.m.outputs.mode }}
