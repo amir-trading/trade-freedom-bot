@@ -38,13 +38,19 @@ from zoneinfo import ZoneInfo
 import requests
 
 NY = ZoneInfo("America/New_York")
-def env(name, default=""):
-    """Read a key, dropping stray spaces and quote marks pasted in with it."""
-    return (os.getenv(name) or default).strip().strip("\"'\u201c\u201d\u2018\u2019` ").strip()
+import re
 
 
-TG_TOKEN = env("TELEGRAM_TOKEN")
-TG_CHAT = env("TELEGRAM_CHAT_ID", "7346306102")
+def env(name, default="", pattern=r"[A-Za-z0-9]+"):
+    """Read a key and keep only the longest run of real key characters
+    (drops quote marks, spaces or labels pasted in with it)."""
+    raw = os.getenv(name) or default
+    runs = re.findall(pattern, raw)
+    return max(runs, key=len) if runs else ""
+
+
+TG_TOKEN = env("TELEGRAM_TOKEN", pattern=r"\d+:[A-Za-z0-9_-]+")
+TG_CHAT = env("TELEGRAM_CHAT_ID", "7346306102", pattern=r"-?\d+")
 AK = env("ALPACA_KEY_ID")
 AS = env("ALPACA_SECRET_KEY")
 FRED_KEY = env("FRED_API_KEY")
