@@ -11,12 +11,19 @@ Sends Amir live SPY alerts on Telegram, following the rules in
   10:00-close  gap filled, broke 30-min high/low, both sides broken,
                range stretched, FOMC 2:00 bar, closing recap
 
-It never places trades.
+Paper trading (Alpaca PAPER account, fake money) for the 2-week test:
+  A  Strong open (30-min move >= 0.5%): enter at 10:00 with the move, stop at the
+     other side of the 30-min range.
+  B  Weak open: first 5-min close beyond the 30-min high/low, enter with the break,
+     stop at the other side of the range.
+  One trade per day, 50 SPY shares, stop order sits on Alpaca (works if the bot is
+  offline), anything open is closed at 3:55. P&L report after every close.
 
 RUN
   python spy_live_agent.py morning     # 8:35 ET -> 12:30 ET
   python spy_live_agent.py afternoon   # 12:25 ET -> close
-  python spy_live_agent.py test        # sends one test message
+  python spy_live_agent.py test        # test message + Alpaca paper account check
+  python spy_live_agent.py report      # paper P&L since the test started
   python spy_live_agent.py replay 2026-11-05   # prints a past day's alerts (no Telegram)
 
 Keys come from environment variables (GitHub Secrets):
@@ -144,11 +151,20 @@ def daily_history(d):
 
 
 def last_price(sym):
+    """Latest pre-market price: IEX live trade if it's from today, else SIP bars (15 min delayed)."""
+    n = now_ny()
     try:
         j = alpaca_get(f"/stocks/{sym}/snapshot", {"feed": "iex"})
-        return float(j["latestTrade"]["p"])
+        tr = j["latestTrade"]
+        if to_ny(tr["t"]).date() == n.date():
+            return float(tr["p"])
     except Exception as e:
         print("snapshot error", sym, e)
+    try:
+        b = bars(sym, "1Min", at(n.date(), 4, 0), n - timedelta(minutes=16), "sip")
+        return float(b[-1]["c"]) if b else None
+    except Exception as e:
+        print("delayed bars error", sym, e)
         return None
 
 
@@ -211,6 +227,128 @@ def earnings(d, prev_session):
     return sorted(set(hit)), sorted(set(miss)), sorted(set(tonight))
 
 
+# ---------------- paper trading (Alpaca paper account) ----------------
+PAPER = "https://paper-api.alpaca.markets/v2"
+PAPER_TRADE = os.getenv("PAPER_TRADE", "1") == "1"
+QTY = int(os.getenv("PAPER_QTY", "50"))          # SPY shares per trade
+TEST_START = "2026-11-09"                         # 2-week test starts here
+STRAT_NAME = {"A": "Strong open", "B": "First 30-min break"}
+
+
+def paper(method, path, **kw):
+    r = requests.request(method, PAPER + path, headers=HDR, timeout=20, **kw)
+    if r.status_code == 404:
+        return None
+    r.raise_for_status()
+    return r.json() if r.text else {}
+
+
+def traded_today(d):
+    try:
+        os_ = paper("GET", "/orders", params={"status": "all", "symbols": "SPY", "limit": 50,
+                                              "after": at(d, 9, 0).isoformat()}) or []
+        return any((o.get("client_order_id") or "").startswith("tf-") for o in os_)
+    except Exception as e:
+        print("orders error", e)
+        return True     # unsure -> don't double-trade
+
+
+def spy_position():
+    try:
+        p = paper("GET", "/positions/SPY")
+        return float(p["qty"]) if p else 0.0
+    except Exception as e:
+        print("position error", e)
+        return None
+
+
+def paper_enter(day, side, strat, price, stop, tm):
+    """Market entry after a 5-min close, with a stop order riding along (works even if the bot is offline)."""
+    if not PAPER_TRADE or DRY or day.paper_done or traded_today(day.d):
+        day.paper_done = True
+        return
+    day.paper_done = True
+    body = {"symbol": "SPY", "qty": str(QTY), "side": side, "type": "market",
+            "time_in_force": "day", "order_class": "oto",
+            "stop_loss": {"stop_price": f"{stop:.2f}"},
+            "client_order_id": f"tf-{strat}-{day.d}"}
+    try:
+        paper("POST", "/orders", json=body)
+        day.in_trade = True
+        word = "LONG" if side == "buy" else "SHORT"
+        send(f"{tm} PAPER {word} {QTY} SPY ~{price:.2f}\nStrategy {strat}: {STRAT_NAME[strat]}. Stop {stop:.2f}. Exit 3:55 if not stopped.")
+    except Exception as e:
+        send(f"{tm} PAPER order failed: {e}")
+
+
+def paper_flatten(day, tm):
+    day.in_trade = False
+    if not PAPER_TRADE or DRY:
+        return
+    try:
+        q = spy_position()
+        paper("DELETE", "/positions", params={"cancel_orders": "true"})
+        if q:
+            send(f"{tm} PAPER EXIT - closed {abs(q):.0f} SPY at end of day.")
+    except Exception as e:
+        send(f"{tm} PAPER exit failed: {e} - check Alpaca.")
+
+
+def paper_report():
+    """P&L per trading day since TEST_START, from Alpaca fills. One trade per day by design."""
+    fills, params = [], {"after": TEST_START, "direction": "asc", "page_size": 100}
+    while True:
+        page = paper("GET", "/account/activities/FILL", params=params) or []
+        fills += page
+        if len(page) < 100:
+            break
+        params["page_token"] = page[-1]["id"]
+    orders = paper("GET", "/orders", params={"status": "all", "symbols": "SPY", "limit": 500,
+                                            "after": TEST_START, "direction": "asc"}) or []
+    strat = {}
+    for o in orders:
+        cid = o.get("client_order_id") or ""
+        if cid.startswith("tf-"):
+            strat[cid[-10:]] = cid.split("-")[1]
+    days = {}
+    for f in fills:
+        if f.get("symbol") != "SPY":
+            continue
+        dd = to_ny(f["transaction_time"]).date().isoformat()
+        q, p = float(f["qty"]), float(f["price"])
+        cash, net = days.get(dd, (0.0, 0.0))
+        if f["side"] == "buy":
+            days[dd] = (cash - q * p, net + q)
+        else:
+            days[dd] = (cash + q * p, net - q)
+    out = {}
+    for dd, (cash, net) in days.items():
+        if abs(net) < 1e-6:
+            out[dd] = (strat.get(dd, "?"), cash)
+    return out
+
+
+def report_text(today=None):
+    try:
+        r = paper_report()
+    except Exception as e:
+        return f"Paper report unavailable: {e}"
+    lines = []
+    if today and today in r:
+        s, p = r[today]
+        lines.append(f"PAPER today: {s} {'+' if p >= 0 else '-'}${abs(p):.2f}")
+    elif today:
+        lines.append("PAPER today: no trade")
+    tot = sum(p for _, p in r.values())
+    lines.append(f"PAPER total since {TEST_START}: {'+' if tot >= 0 else '-'}${abs(tot):.2f} ({len(r)} trades)")
+    for s in ("A", "B"):
+        ps = [p for k, p in r.values() if k == s]
+        if ps:
+            w = sum(1 for p in ps if p > 0)
+            lines.append(f"  {s} {STRAT_NAME[s]}: {len(ps)} trades, {w}W/{len(ps) - w}L, {'+' if sum(ps) >= 0 else '-'}${abs(sum(ps)):.2f}")
+    return "\n".join(lines)
+
+
 # ---------------- the day ----------------
 class Day:
     def __init__(self, d, close_time, need_premarket):
@@ -234,6 +372,8 @@ class Day:
         self.move30 = None
         self.flags = set()
         self.done = set()       # bar start times already handled
+        self.paper_done = False
+        self.in_trade = False
 
     # ---- morning score (same rules as the backtest) ----
     def score(self, spy_px, qqq_px):
@@ -327,14 +467,28 @@ class Day:
             self.move30 = pct(f[-1]["c"], self.open)
             m = self.move30
             if m >= STRONG_OPEN:
-                head, tail = "STRONG OPEN UP -> lean CALLS", f"Stop idea: back inside range below {self.orh:.2f}. Held 59% in backtest."
+                head, tail = "STRONG OPEN UP -> lean CALLS", f"Stop: below 30-min low {self.orl:.2f}. Held 59% in backtest."
             elif m <= -STRONG_OPEN:
-                head, tail = "STRONG OPEN DOWN -> lean PUTS", f"Stop idea: back inside range above {self.orl:.2f}. Held 59% in backtest."
+                head, tail = "STRONG OPEN DOWN -> lean PUTS", f"Stop: above 30-min high {self.orh:.2f}. Held 59% in backtest."
             else:
                 head, tail = "NO EDGE -> chop likely", "Don't chase the first break. Both sides break on 52% of days."
             say(f"10:00 SPY - {head}\nFirst 30 min {sign(m)}{m:.2f}%  ORH {self.orh:.2f}  ORL {self.orl:.2f}\n{tail}")
+            # Strategy A: strong open -> trade with it, stop at the other side of the opening range
+            if alert and abs(m) >= STRONG_OPEN:
+                px = f[-1]["c"]
+                if m > 0:
+                    paper_enter(self, "buy", "A", px, self.orl, "10:00")
+                else:
+                    paper_enter(self, "sell", "A", px, self.orh, "10:00")
 
         tm = end.strftime("%-I:%M")
+
+        # stopped out? (stop order filled on Alpaca's side)
+        if alert and self.in_trade and PAPER_TRADE and not DRY:
+            q = spy_position()
+            if q == 0:
+                self.in_trade = False
+                send(f"{tm} PAPER STOPPED OUT - position closed by the stop.")
 
         # gap filled (any time after the open)
         if "fill" not in self.flags and self.open != self.prev_close:
@@ -350,11 +504,16 @@ class Day:
                 note = "Strong open = with the trend." if (strong and self.move30 > 0) else "Weak open = could be a fake, small size."
                 if "dn" not in self.flags:
                     say(f"{tm} SPY BROKE 30-MIN HIGH {self.orh:.2f}\nPrice {b['c']:.2f}. {note}")
+                    # Strategy B: weak open, first break of the 30-min range -> go with it, stop at the other side
+                    if alert and not strong and t < self.close_time - timedelta(minutes=60):
+                        paper_enter(self, "buy", "B", b["c"], self.orl, tm)
             if "dn" not in self.flags and b["c"] < self.orl:
                 self.flags.add("dn")
                 note = "Strong open = with the trend." if (strong and self.move30 < 0) else "Weak open = could be a fake, small size."
                 if "up" not in self.flags:
                     say(f"{tm} SPY BROKE 30-MIN LOW {self.orl:.2f}\nPrice {b['c']:.2f}. {note}")
+                    if alert and not strong and t < self.close_time - timedelta(minutes=60):
+                        paper_enter(self, "sell", "B", b["c"], self.orh, tm)
             if {"up", "dn"} <= self.flags and "both" not in self.flags:
                 self.flags.add("both")
                 say(f"{tm} SPY BOTH SIDES BROKEN\nPrice {b['c']:.2f}. Chop day confirmed - stand down or scalp small.")
@@ -368,6 +527,9 @@ class Day:
             m = pct(b["c"], b["o"])
             say(f"2:05 SPY FOMC OUT\nFirst 5-min bar {sign(m)}{m:.2f}% ({b['l']:.2f}-{b['h']:.2f}). Act on the break of this bar, not the spike.")
 
+        if alert and end == self.close_time - timedelta(minutes=5):
+            paper_flatten(self, tm)
+
         if end == self.close_time:
             hi, lo = max(x["h"] for x in upto), min(x["l"] for x in upto)
             dm = pct(b["c"], self.prev_close)
@@ -378,6 +540,9 @@ class Day:
                     "TREND DOWN" if body >= .6 and loc <= .25 and b["c"] < self.open else "CHOPPY")
             say(f"CLOSE SPY {b['c']:.2f} ({sign(dm)}{dm:.2f}%) - {kind} day\n"
                 f"Range {pct(hi, lo):.2f}%. Morning call was {self.call}.")
+            if alert and PAPER_TRADE and not DRY:
+                time.sleep(20)
+                send(report_text(str(self.d)))
 
 
 def run_bars(day, start_alert_after, stop_after, live=True):
@@ -410,6 +575,14 @@ def main():
     mode = sys.argv[1] if len(sys.argv) > 1 else "morning"
     if mode == "test":
         send("Trade Freedom bot connected. SPY alerts start at 9:00 on market days.")
+        try:
+            a = paper("GET", "/account")
+            send(f"Alpaca paper account OK. Equity ${float(a['equity']):,.2f}. Paper trading {'ON' if PAPER_TRADE else 'OFF'}, {QTY} SPY shares per trade.")
+        except Exception as e:
+            send(f"Alpaca paper account check failed: {e}")
+        return
+    if mode == "report":
+        send(report_text())
         return
 
     if mode == "replay":
@@ -447,6 +620,7 @@ def main():
         if not (at(d, 11, 55) <= start <= at(d, 13, 10)) or close_t <= at(d, *HANDOFF):
             print("Not the afternoon window (or early close) - exiting."); return
         day = Day(d, close_t, need_premarket=False)
+        day.in_trade = bool(spy_position())
         run_bars(day, at(d, *HANDOFF), close_t)
 
 
