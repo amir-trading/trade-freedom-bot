@@ -38,11 +38,16 @@ from zoneinfo import ZoneInfo
 import requests
 
 NY = ZoneInfo("America/New_York")
-TG_TOKEN = os.getenv("TELEGRAM_TOKEN", "")
-TG_CHAT = os.getenv("TELEGRAM_CHAT_ID", "7346306102")
-AK = os.getenv("ALPACA_KEY_ID", "")
-AS = os.getenv("ALPACA_SECRET_KEY", "")
-FRED_KEY = os.getenv("FRED_API_KEY", "")
+def env(name, default=""):
+    """Read a key, dropping stray spaces and quote marks pasted in with it."""
+    return (os.getenv(name) or default).strip().strip("\"'\u201c\u201d\u2018\u2019` ").strip()
+
+
+TG_TOKEN = env("TELEGRAM_TOKEN")
+TG_CHAT = env("TELEGRAM_CHAT_ID", "7346306102")
+AK = env("ALPACA_KEY_ID")
+AS = env("ALPACA_SECRET_KEY")
+FRED_KEY = env("FRED_API_KEY")
 
 DATA = "https://data.alpaca.markets/v2"
 HDR = {"APCA-API-KEY-ID": AK, "APCA-API-SECRET-KEY": AS}
