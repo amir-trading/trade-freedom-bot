@@ -1,5 +1,5 @@
 """
-Trade Freedom - SPY Live Alert Agent (v1)
+Trade Freedom - SPY Live Alert Agent + Paper Trader (v2)
 
 Sends Amir live SPY alerts on Telegram, following the rules in
 "SPY Live Alert Agent - Rules" (built from the 5-year SPY brain backtest).
@@ -11,26 +11,34 @@ Sends Amir live SPY alerts on Telegram, following the rules in
   10:00-close  gap filled, broke 30-min high/low, both sides broken,
                range stretched, FOMC 2:00 bar, closing recap
 
-Paper trading (Alpaca PAPER account, fake money) for the 2-week test:
-  A  Strong open (30-min move >= 0.5%): enter at 10:00 with the move, stop at the
-     other side of the 30-min range.
-  B  Weak open: first 5-min close beyond the 30-min high/low, enter with the break,
-     stop at the other side of the range.
-  One trade per day, 50 SPY shares, stop order sits on Alpaca (works if the bot is
-  offline), anything open is closed at 3:55. P&L report after every close.
+Paper trading (Alpaca PAPER account, fake money) - Amir's final rules, Nov 9 2026:
+  - Stocks (not SPY): fast movers, price > $5, high volume, up >= 3% on the day.
+  - Setup: a 5-min candle CLOSES at a new high of the day and above VWAP.
+  - Every entry is an Alpaca BRACKET order: buy + take profit +4% + stop loss -4%.
+    Alpaca runs both exits even if the bot stops.
+  - Many trades a day. After a trade closes, the same stock can be bought again
+    on a new setup (a new high of the day).
+  - Max $5,000 per trade, max 5 open trades, cash only (no margin), long only.
+  - Entries 9:45 AM - 3:30 PM New York time. Everything closed at 3:55 PM.
+  - News days: no entries before the release (FOMC: none before 2:05 PM).
+    Half size ($2,500) on the day before a CPI / jobs / FOMC day.
+  - Telegram message for every entry and every exit, and a day summary at the close.
+    The full trade log comes from Alpaca's order history ("report" mode).
 
 RUN
   python spy_live_agent.py morning     # 8:35 ET -> 12:30 ET
   python spy_live_agent.py afternoon   # 12:25 ET -> close
-  python spy_live_agent.py test        # test message + Alpaca paper account check
-  python spy_live_agent.py report      # paper P&L since the test started
-  python spy_live_agent.py replay 2026-11-05   # prints a past day's alerts (no Telegram)
+  python spy_live_agent.py test        # test message + Alpaca + scanner check (no orders)
+  python spy_live_agent.py report      # full paper trade log + totals since the test started
+  python spy_live_agent.py replay 2026-11-05   # prints a past day's SPY alerts (no Telegram)
 
 Keys come from environment variables (GitHub Secrets):
   TELEGRAM_TOKEN, TELEGRAM_CHAT_ID, ALPACA_KEY_ID, ALPACA_SECRET_KEY, FRED_API_KEY,
   ANTHROPIC_API_KEY (optional - adds Claude's short read to the 9:00 brief)
 """
+import math
 import os
+import re
 import sys
 import time
 from datetime import date, datetime, timedelta
@@ -39,7 +47,6 @@ from zoneinfo import ZoneInfo
 import requests
 
 NY = ZoneInfo("America/New_York")
-import re
 
 
 def env(name, default="", pattern=r"[A-Za-z0-9]+"):
@@ -58,6 +65,7 @@ FRED_KEY = env("FRED_API_KEY")
 CLAUDE_KEY = env("ANTHROPIC_API_KEY", pattern=r"sk-ant-[A-Za-z0-9_-]+")
 
 DATA = "https://data.alpaca.markets/v2"
+SCREENER = "https://data.alpaca.markets/v1beta1/screener/stocks"
 HDR = {"APCA-API-KEY-ID": AK, "APCA-API-SECRET-KEY": AS}
 
 MEGA_CAPS = ["AAPL", "MSFT", "NVDA", "AMZN", "GOOGL", "META", "TSLA",
@@ -118,7 +126,7 @@ def claude_model():
                      headers={"x-api-key": CLAUDE_KEY, "anthropic-version": "2023-06-01"},
                      params={"limit": 100}, timeout=20)
     r.raise_for_status()
-    ids = [m["id"] for m in r.json().get("data", [])]   # newest first
+    ids = [m["id"] for m in r.json().get("data", [])]  # newest first
     sonnet = [i for i in ids if "sonnet" in i]
     _CLAUDE_MODEL = (sonnet or ids)[0]
     return _CLAUDE_MODEL
@@ -148,6 +156,10 @@ def pct(a, b):
 
 def sign(x):
     return "+" if x >= 0 else ""
+
+
+def money(x):
+    return f"{'+' if x >= 0 else '-'}${abs(x):,.2f}"
 
 
 # ---------------- data ----------------
@@ -187,6 +199,23 @@ def market_hours(d):
     except Exception as e:
         print("calendar error, assuming normal day:", e)
         return (at(d, 9, 30), at(d, 16, 0)) if d.weekday() < 5 else None
+
+
+def next_trading_day(d):
+    try:
+        r = requests.get("https://paper-api.alpaca.markets/v2/calendar", headers=HDR,
+                         params={"start": str(d + timedelta(days=1)),
+                                 "end": str(d + timedelta(days=10))}, timeout=20)
+        r.raise_for_status()
+        cal = r.json()
+        if cal:
+            return date.fromisoformat(cal[0]["date"])
+    except Exception as e:
+        print("calendar error (next day):", e)
+    n = d + timedelta(days=1)
+    while n.weekday() >= 5:
+        n += timedelta(days=1)
+    return n
 
 
 def daily_history(d):
@@ -246,6 +275,15 @@ def fred_today(release_id, d):
         return False
 
 
+def news_day(d):
+    """Names of the big reports on day d (CPI, Jobs, FOMC)."""
+    n = []
+    if fred_today(10, d): n.append("CPI")
+    if fred_today(50, d): n.append("Jobs")
+    if str(d) in FOMC: n.append("FOMC")
+    return n
+
+
 def earnings(d, prev_session):
     """Mega-cap reports hitting today's session, misses among them, and tonight's reports."""
     hit, miss, tonight = [], [], []
@@ -277,126 +315,322 @@ def earnings(d, prev_session):
     return sorted(set(hit)), sorted(set(miss)), sorted(set(tonight))
 
 
-# ---------------- paper trading (Alpaca paper account) ----------------
+# ---------------- paper trading (Alpaca PAPER account, fake money) ----------------
 PAPER = "https://paper-api.alpaca.markets/v2"
 PAPER_TRADE = os.getenv("PAPER_TRADE", "1") == "1"
-QTY = int(os.getenv("PAPER_QTY", "50"))          # SPY shares per trade
-TEST_START = "2026-11-09"                         # 2-week test starts here
-STRAT_NAME = {"A": "Strong open", "B": "First 30-min break"}
+TEST_START = "2026-11-10"   # one-week test of the final rules starts here
+
+TAKE_PROFIT = 4.0           # % above entry
+STOP_LOSS = 4.0             # % below entry
+MAX_PER_TRADE = 5000.0      # $ per trade
+MAX_OPEN = 5                # open trades at the same time
+HALF_SIZE = 0.5             # size on the day before a CPI / jobs / FOMC day
+MIN_PRICE = 5.0
+MIN_DAY_CHANGE = 3.0        # % up on the day to count as a fast mover
+MIN_DAY_VOLUME = 2_000_000  # shares traded today (15-min delayed consolidated)
+ENTRY_START = (9, 45)
+ENTRY_END = (15, 30)
+FLATTEN_BEFORE_CLOSE = 5    # minutes before the close -> 3:55 on a normal day
+NO_TRADE = {"SPY"}          # SPY shares rarely move 4% in a day
+TAG = "tf2"                 # client_order_id prefix for every bot order
 
 
 def paper(method, path, **kw):
     r = requests.request(method, PAPER + path, headers=HDR, timeout=20, **kw)
     if r.status_code == 404:
         return None
-    r.raise_for_status()
+    if not r.ok:
+        raise RuntimeError(f"{r.status_code} {r.text[:200]}")
     return r.json() if r.text else {}
 
 
-def traded_today(d):
-    try:
-        os_ = paper("GET", "/orders", params={"status": "all", "symbols": "SPY", "limit": 50,
-                                              "after": at(d, 9, 0).isoformat()}) or []
-        return any((o.get("client_order_id") or "").startswith("tf-") for o in os_)
-    except Exception as e:
-        print("orders error", e)
-        return True     # unsure -> don't double-trade
-
-
-def spy_position():
-    try:
-        p = paper("GET", "/positions/SPY")
-        return float(p["qty"]) if p else 0.0
-    except Exception as e:
-        print("position error", e)
-        return None
-
-
-def paper_enter(day, side, strat, price, stop, tm):
-    """Market entry after a 5-min close, with a stop order riding along (works even if the bot is offline)."""
-    if not PAPER_TRADE or DRY or day.paper_done or traded_today(day.d):
-        day.paper_done = True
-        return
-    day.paper_done = True
-    body = {"symbol": "SPY", "qty": str(QTY), "side": side, "type": "market",
-            "time_in_force": "day", "order_class": "oto",
-            "stop_loss": {"stop_price": f"{stop:.2f}"},
-            "client_order_id": f"tf-{strat}-{day.d}"}
-    try:
-        paper("POST", "/orders", json=body)
-        day.in_trade = True
-        word = "LONG" if side == "buy" else "SHORT"
-        send(f"{tm} PAPER {word} {QTY} SPY ~{price:.2f}\nStrategy {strat}: {STRAT_NAME[strat]}. Stop {stop:.2f}. Exit 3:55 if not stopped.")
-    except Exception as e:
-        send(f"{tm} PAPER order failed: {e}")
-
-
-def paper_flatten(day, tm):
-    day.in_trade = False
-    if not PAPER_TRADE or DRY:
-        return
-    try:
-        q = spy_position()
-        paper("DELETE", "/positions", params={"cancel_orders": "true"})
-        if q:
-            send(f"{tm} PAPER EXIT - closed {abs(q):.0f} SPY at end of day.")
-    except Exception as e:
-        send(f"{tm} PAPER exit failed: {e} - check Alpaca.")
-
-
-def paper_report():
-    """P&L per trading day since TEST_START, from Alpaca fills. One trade per day by design."""
-    fills, params = [], {"after": TEST_START, "direction": "asc", "page_size": 100}
+def bot_orders(after):
+    """All bot bracket orders since `after` (with their take-profit / stop legs), oldest first."""
+    out, since = [], after
     while True:
-        page = paper("GET", "/account/activities/FILL", params=params) or []
-        fills += page
-        if len(page) < 100:
+        page = paper("GET", "/orders", params={"status": "all", "after": since.isoformat(),
+                                                "direction": "asc", "nested": "true",
+                                                "limit": 500}) or []
+        out += page
+        if len(page) < 500:
             break
-        params["page_token"] = page[-1]["id"]
-    orders = paper("GET", "/orders", params={"status": "all", "symbols": "SPY", "limit": 500,
-                                            "after": TEST_START, "direction": "asc"}) or []
-    strat = {}
+        since = to_ny(page[-1]["submitted_at"])
+    seen, res = set(), []
+    for o in out:
+        if o["id"] in seen:
+            continue
+        seen.add(o["id"])
+        res.append(o)
+    return res
+
+
+def trade_log(after):
+    """Turns the bot's orders into trades: entry, exit, $ result."""
+    orders = bot_orders(after)
+    by_cid = {o.get("client_order_id") or "": o for o in orders}
+    trades = []
     for o in orders:
         cid = o.get("client_order_id") or ""
-        if cid.startswith("tf-"):
-            strat[cid[-10:]] = cid.split("-")[1]
-    days = {}
-    for f in fills:
-        if f.get("symbol") != "SPY":
+        if not cid.startswith(TAG + "-") or cid.endswith("-x"):
             continue
-        dd = to_ny(f["transaction_time"]).date().isoformat()
-        q, p = float(f["qty"]), float(f["price"])
-        cash, net = days.get(dd, (0.0, 0.0))
-        if f["side"] == "buy":
-            days[dd] = (cash - q * p, net + q)
-        else:
-            days[dd] = (cash + q * p, net - q)
-    out = {}
-    for dd, (cash, net) in days.items():
-        if abs(net) < 1e-6:
-            out[dd] = (strat.get(dd, "?"), cash)
-    return out
+        if o.get("status") != "filled" and float(o.get("filled_qty") or 0) == 0:
+            continue
+        qty = float(o["filled_qty"])
+        entry = float(o["filled_avg_price"])
+        t = {"cid": cid, "sym": o["symbol"], "qty": qty, "entry": entry,
+             "entry_time": to_ny(o["filled_at"]), "exit": None, "exit_time": None, "how": None}
+        for leg in o.get("legs") or []:
+            if leg.get("status") == "filled":
+                t["exit"] = float(leg["filled_avg_price"])
+                t["exit_time"] = to_ny(leg["filled_at"])
+                t["how"] = "TARGET +4%" if leg.get("type") == "limit" else "STOP -4%"
+        x = by_cid.get(cid + "-x")
+        if t["exit"] is None and x and x.get("status") == "filled":
+            t["exit"] = float(x["filled_avg_price"])
+            t["exit_time"] = to_ny(x["filled_at"])
+            t["how"] = "3:55 CLOSE"
+        if t["exit"] is not None:
+            t["pnl"] = (t["exit"] - entry) * qty
+            t["win"] = t["pnl"] > 0
+        trades.append(t)
+    return trades
 
 
-def report_text(today=None):
+def trade_line(t):
+    tm = t["entry_time"].strftime("%-m/%-d %-I:%M")
+    if t["exit"] is None:
+        return f"{tm} {t['sym']} {t['qty']:.0f} sh in {t['entry']:.2f} - still open"
+    return (f"{tm} {t['sym']} {t['qty']:.0f} sh in {t['entry']:.2f} out {t['exit']:.2f} "
+            f"({t['exit_time'].strftime('%-I:%M')}, {t['how']}) {'WIN' if t['win'] else 'LOSS'} {money(t['pnl'])}")
+
+
+def summary_text(trades, title):
+    done = [t for t in trades if t["exit"] is not None]
+    w = sum(1 for t in done if t["win"])
+    tot = sum(t["pnl"] for t in done)
+    lines = [f"{title}: {len(done)} trades, {w} wins, {len(done) - w} losses, total {money(tot)}"]
+    open_ = [t for t in trades if t["exit"] is None]
+    if open_:
+        lines.append(f"{len(open_)} still open")
+    return lines
+
+
+def screen_movers():
+    """Fast movers right now: up >= 3% on the day, price > $5, high volume. Best first."""
+    syms = set()
     try:
-        r = paper_report()
+        r = requests.get(SCREENER + "/most-actives", headers=HDR,
+                         params={"by": "volume", "top": 50}, timeout=20)
+        r.raise_for_status()
+        syms |= {x["symbol"] for x in r.json().get("most_actives", [])}
     except Exception as e:
-        return f"Paper report unavailable: {e}"
-    lines = []
-    if today and today in r:
-        s, p = r[today]
-        lines.append(f"PAPER today: {s} {'+' if p >= 0 else '-'}${abs(p):.2f}")
-    elif today:
-        lines.append("PAPER today: no trade")
-    tot = sum(p for _, p in r.values())
-    lines.append(f"PAPER total since {TEST_START}: {'+' if tot >= 0 else '-'}${abs(tot):.2f} ({len(r)} trades)")
-    for s in ("A", "B"):
-        ps = [p for k, p in r.values() if k == s]
-        if ps:
-            w = sum(1 for p in ps if p > 0)
-            lines.append(f"  {s} {STRAT_NAME[s]}: {len(ps)} trades, {w}W/{len(ps) - w}L, {'+' if sum(ps) >= 0 else '-'}${abs(sum(ps)):.2f}")
-    return "\n".join(lines)
+        print("most-actives error", e)
+    try:
+        r = requests.get(SCREENER + "/movers", headers=HDR, params={"top": 50}, timeout=20)
+        r.raise_for_status()
+        syms |= {x["symbol"] for x in r.json().get("gainers", [])}
+    except Exception as e:
+        print("movers error", e)
+    syms = sorted(s for s in syms if s not in NO_TRADE and s.isalpha())
+    snaps = {}
+    for i in range(0, len(syms), 50):
+        chunk = ",".join(syms[i:i + 50])
+        for feed in ("delayed_sip", "iex"):
+            try:
+                snaps.update(alpaca_get("/stocks/snapshots", {"symbols": chunk, "feed": feed}) or {})
+                break
+            except Exception as e:
+                print("snapshots error", feed, e)
+    out = []
+    for s, sn in snaps.items():
+        try:
+            day, prev = sn.get("dailyBar") or {}, sn.get("prevDailyBar") or {}
+            price = float((sn.get("latestTrade") or {}).get("p") or day.get("c") or 0)
+            ch = pct(price, float(prev["c"]))
+            vol = float(day.get("v") or 0)
+        except Exception:
+            continue
+        if price > MIN_PRICE and ch >= MIN_DAY_CHANGE and vol >= MIN_DAY_VOLUME:
+            out.append({"sym": s, "price": price, "chg": ch, "vol": vol})
+    return sorted(out, key=lambda x: -x["chg"])
+
+
+def tradable(sym, cache={}):
+    if sym not in cache:
+        try:
+            a = paper("GET", f"/assets/{sym}") or {}
+            cache[sym] = bool(a.get("tradable")) and a.get("exchange") not in ("OTC", None)
+        except Exception as e:
+            print("asset error", sym, e)
+            cache[sym] = False
+    return cache[sym]
+
+
+def setup(sym, d, now):
+    """Entry setup on completed 5-min bars: the last candle CLOSED at a new high of the day
+    and above VWAP. Returns (close, why) or None."""
+    try:
+        b = bars(sym, "5Min", at(d, 9, 30), now, "iex")
+    except Exception as e:
+        print("bars error", sym, e)
+        return None
+    b = [x for x in b if to_ny(x["t"]) >= at(d, 9, 30)
+         and to_ny(x["t"]) + timedelta(minutes=5) <= now]
+    if len(b) < 3:
+        return None
+    last, before = b[-1], b[:-1]
+    vol = sum(x["v"] for x in b)
+    vwap = sum(x.get("vw", x["c"]) * x["v"] for x in b) / vol if vol else last["c"]
+    if last["c"] > max(x["h"] for x in before) and last["c"] > vwap:
+        return last["c"], f"5-min close {last['c']:.2f} = new high of day, above VWAP {vwap:.2f}"
+    return None
+
+
+class Trader:
+    """Paper trades fast-moving stocks with +4% / -4% bracket orders.
+    Everything is read back from Alpaca each time, so the morning and afternoon
+    GitHub jobs (and a restart) all see the same trades."""
+
+    def __init__(self, d, close_time, active_from, active_to):
+        self.d, self.close_time = d, close_time
+        self.active_from, self.active_to = active_from, active_to   # this job's slice of the day
+        self.entry_start = at(d, *ENTRY_START)
+        self.entry_end = min(at(d, *ENTRY_END), close_time - timedelta(minutes=25))
+        self.flatten_at = close_time - timedelta(minutes=FLATTEN_BEFORE_CLOSE)
+        today = news_day(d)
+        tomorrow = news_day(next_trading_day(d))
+        self.fomc_today = "FOMC" in today
+        self.size = MAX_PER_TRADE * (HALF_SIZE if tomorrow else 1)
+        self.note = []
+        if today:
+            self.note.append(f"{'/'.join(today)} today - entries only after the release"
+                             + (" (2:05 PM)" if self.fomc_today else " (out at 8:30)"))
+        if tomorrow:
+            self.note.append(f"{'/'.join(tomorrow)} tomorrow - half size ${self.size:,.0f} per trade")
+        self.flattened = False
+        self.seen_exits = set()
+
+    def log_exits(self, trades):
+        for t in trades:
+            if t["exit"] is None:
+                continue
+            key = (t["sym"], t["entry_time"])
+            if key in self.seen_exits:
+                continue
+            self.seen_exits.add(key)
+            if self.active_from < t["exit_time"] <= self.active_to:
+                send(f"{t['exit_time'].strftime('%-I:%M')} PAPER EXIT {t['sym']} ({t['how']}) "
+                     f"{'WIN' if t['win'] else 'LOSS'} {money(t['pnl'])}\n" + trade_line(t))
+
+    def tick(self):
+        if not PAPER_TRADE or DRY:
+            return
+        n = now_ny()
+        try:
+            trades = trade_log(at(self.d, 9, 0))
+        except Exception as e:
+            print("trade log error", e)
+            trades = []
+        self.log_exits(trades)
+        if not (self.active_from <= n < self.active_to):
+            return
+        if n >= self.flatten_at:
+            self.flatten(trades)
+            return
+        bar_end = n.replace(second=0, microsecond=0)
+        if not (self.entry_start <= bar_end <= self.entry_end):
+            return
+        if self.fomc_today and bar_end < at(self.d, 14, 5):
+            return
+        try:
+            self.enter(trades, n)
+        except Exception as e:
+            print("entry error", e)
+
+    def enter(self, trades, n):
+        positions = paper("GET", "/positions") or []
+        open_orders = paper("GET", "/orders", params={"status": "open", "limit": 500}) or []
+        busy = {p["symbol"] for p in positions} | {o["symbol"] for o in open_orders
+                                                  if o.get("side") == "buy"}
+        slots = MAX_OPEN - len(busy)
+        if slots <= 0:
+            return
+        cash = float((paper("GET", "/account") or {}).get("cash") or 0)
+        for c in screen_movers():
+            if slots <= 0:
+                break
+            s = c["sym"]
+            if s in busy or not tradable(s):
+                continue
+            hit = setup(s, self.d, n)
+            if not hit:
+                continue
+            px, why = hit
+            size = min(self.size, cash)
+            qty = math.floor(size / px)
+            if qty < 1:
+                break
+            tp = round(px * (1 + TAKE_PROFIT / 100), 2)
+            sl = round(px * (1 - STOP_LOSS / 100), 2)
+            cid = f"{TAG}-{s}-{n.strftime('%Y%m%d-%H%M')}"
+            body = {"symbol": s, "qty": str(qty), "side": "buy", "type": "market",
+                    "time_in_force": "day", "order_class": "bracket",
+                    "take_profit": {"limit_price": f"{tp:.2f}"},
+                    "stop_loss": {"stop_price": f"{sl:.2f}"},
+                    "client_order_id": cid}
+            try:
+                paper("POST", "/orders", json=body)
+            except Exception as e:
+                send(f"{n.strftime('%-I:%M')} PAPER order failed for {s}: {e}")
+                continue
+            busy.add(s)
+            slots -= 1
+            cash -= qty * px
+            send(f"{n.strftime('%-I:%M')} PAPER BUY {qty} {s} ~{px:.2f} (${qty * px:,.0f})\n"
+                 f"Target {tp:.2f} (+4%)  Stop {sl:.2f} (-4%)\n"
+                 f"Why: up {c['chg']:.1f}% today, {why}.")
+
+    def flatten(self, trades):
+        """3:55 - close everything. No overnight holds."""
+        if self.flattened:
+            return
+        self.flattened = True
+        tm = now_ny().strftime("%-I:%M")
+        try:
+            paper("DELETE", "/orders")      # cancels the bracket legs still waiting
+            time.sleep(3)
+            for t in trades:
+                if t["exit"] is not None:
+                    continue
+                p = paper("GET", f"/positions/{t['sym']}")
+                if not p:
+                    continue
+                qty = min(float(p["qty"]), t["qty"])
+                cid = t["cid"]
+                paper("POST", "/orders", json={"symbol": t["sym"], "qty": str(int(qty)),
+                                               "side": "sell", "type": "market",
+                                               "time_in_force": "day",
+                                               "client_order_id": cid + "-x"})
+            time.sleep(5)
+            left = paper("GET", "/positions") or []
+            if left:
+                paper("DELETE", "/positions", params={"cancel_orders": "true"})
+            send(f"{tm} PAPER - closing everything for the day (no overnight holds).")
+        except Exception as e:
+            send(f"{tm} PAPER close-all failed: {e} - check Alpaca.")
+
+    def day_summary(self):
+        time.sleep(20)
+        try:
+            today = trade_log(at(self.d, 9, 0))
+            week = trade_log(at(date.fromisoformat(TEST_START), 0, 0))
+        except Exception as e:
+            send(f"PAPER day summary unavailable: {e}")
+            return
+        lines = summary_text(today, f"PAPER {self.d}")
+        lines += [trade_line(t) for t in today]
+        lines += [""] + summary_text(week, f"Since {TEST_START}")
+        send("\n".join(lines))
 
 
 # ---------------- the day ----------------
@@ -422,8 +656,7 @@ class Day:
         self.move30 = None
         self.flags = set()
         self.done = set()       # bar start times already handled
-        self.paper_done = False
-        self.in_trade = False
+        self.trader = None      # paper trader (set by main for live runs)
 
     # ---- morning score (same rules as the backtest) ----
     def score(self, spy_px, qqq_px):
@@ -486,6 +719,10 @@ class Day:
             "the bot makes that call at 10:00.")
         if ai:
             lines.append("\nClaude read:\n" + ai)
+        if self.trader and PAPER_TRADE:
+            lines.append("\nPaper trading today: stocks, +4% / -4% brackets, "
+                         f"${self.trader.size:,.0f} per trade, max {MAX_OPEN} open, entries 9:45-3:30.")
+            lines += self.trader.note
         send("\n".join(lines))
 
     # ---- one completed 5-minute bar ----
@@ -519,7 +756,7 @@ class Day:
             say(f"9:45 SPY - first 15 min {sign(m15)}{m15:.2f}%\n"
                 f"High {max(x['h'] for x in f):.2f} / Low {min(x['l'] for x in f):.2f}. Heads-up only, no call.")
 
-        # 10:00 - the direction call
+        # 10:00 - the direction call (alert only - no SPY trades)
         if end == at(self.d, 10, 0):
             f = [x for x in upto if to_ny(x["t"]) < at(self.d, 10, 0)]
             self.orh, self.orl = max(x["h"] for x in f), min(x["l"] for x in f)
@@ -532,22 +769,8 @@ class Day:
             else:
                 head, tail = "NO EDGE -> chop likely", "Don't chase the first break. Both sides break on 52% of days."
             say(f"10:00 SPY - {head}\nFirst 30 min {sign(m)}{m:.2f}%  ORH {self.orh:.2f}  ORL {self.orl:.2f}\n{tail}")
-            # Strategy A: strong open -> trade with it, stop at the other side of the opening range
-            if alert and abs(m) >= STRONG_OPEN:
-                px = f[-1]["c"]
-                if m > 0:
-                    paper_enter(self, "buy", "A", px, self.orl, "10:00")
-                else:
-                    paper_enter(self, "sell", "A", px, self.orh, "10:00")
 
         tm = end.strftime("%-I:%M")
-
-        # stopped out? (stop order filled on Alpaca's side)
-        if alert and self.in_trade and PAPER_TRADE and not DRY:
-            q = spy_position()
-            if q == 0:
-                self.in_trade = False
-                send(f"{tm} PAPER STOPPED OUT - position closed by the stop.")
 
         # gap filled (any time after the open)
         if "fill" not in self.flags and self.open != self.prev_close:
@@ -563,16 +786,11 @@ class Day:
                 note = "Strong open = with the trend." if (strong and self.move30 > 0) else "Weak open = could be a fake, small size."
                 if "dn" not in self.flags:
                     say(f"{tm} SPY BROKE 30-MIN HIGH {self.orh:.2f}\nPrice {b['c']:.2f}. {note}")
-                    # Strategy B: weak open, first break of the 30-min range -> go with it, stop at the other side
-                    if alert and not strong and t < self.close_time - timedelta(minutes=60):
-                        paper_enter(self, "buy", "B", b["c"], self.orl, tm)
             if "dn" not in self.flags and b["c"] < self.orl:
                 self.flags.add("dn")
                 note = "Strong open = with the trend." if (strong and self.move30 < 0) else "Weak open = could be a fake, small size."
                 if "up" not in self.flags:
                     say(f"{tm} SPY BROKE 30-MIN LOW {self.orl:.2f}\nPrice {b['c']:.2f}. {note}")
-                    if alert and not strong and t < self.close_time - timedelta(minutes=60):
-                        paper_enter(self, "sell", "B", b["c"], self.orh, tm)
             if {"up", "dn"} <= self.flags and "both" not in self.flags:
                 self.flags.add("both")
                 say(f"{tm} SPY BOTH SIDES BROKEN\nPrice {b['c']:.2f}. Chop day confirmed - stand down or scalp small.")
@@ -586,9 +804,6 @@ class Day:
             m = pct(b["c"], b["o"])
             say(f"2:05 SPY FOMC OUT\nFirst 5-min bar {sign(m)}{m:.2f}% ({b['l']:.2f}-{b['h']:.2f}). Act on the break of this bar, not the spike.")
 
-        if alert and end == self.close_time - timedelta(minutes=5):
-            paper_flatten(self, tm)
-
         if end == self.close_time:
             hi, lo = max(x["h"] for x in upto), min(x["l"] for x in upto)
             dm = pct(b["c"], self.prev_close)
@@ -599,9 +814,8 @@ class Day:
                     "TREND DOWN" if body >= .6 and loc <= .25 and b["c"] < self.open else "CHOPPY")
             say(f"CLOSE SPY {b['c']:.2f} ({sign(dm)}{dm:.2f}%) - {kind} day\n"
                 f"Range {pct(hi, lo):.2f}%. Morning call was {self.call}.")
-            if alert and PAPER_TRADE and not DRY:
-                time.sleep(20)
-                send(report_text(str(self.d)))
+            if alert and self.trader and PAPER_TRADE and not DRY:
+                self.trader.day_summary()
 
 
 def run_bars(day, start_alert_after, stop_after, live=True):
@@ -615,6 +829,11 @@ def run_bars(day, start_alert_after, stop_after, live=True):
             print("bars error", e)
             today = []
         today = [x for x in today if to_ny(x["t"]) >= at(d, 9, 30)]
+        if live and day.trader:
+            try:
+                day.trader.tick()
+            except Exception as e:
+                print("trader error", e)
         for b in today:
             t = to_ny(b["t"])
             end = t + timedelta(minutes=5)
@@ -636,9 +855,18 @@ def main():
         send("Trade Freedom bot connected. SPY alerts start at 9:00 on market days.")
         try:
             a = paper("GET", "/account")
-            send(f"Alpaca paper account OK. Equity ${float(a['equity']):,.2f}. Paper trading {'ON' if PAPER_TRADE else 'OFF'}, {QTY} SPY shares per trade.")
+            send(f"Alpaca paper account OK. Equity ${float(a['equity']):,.2f}, cash ${float(a['cash']):,.2f}. "
+                 f"Paper trading {'ON' if PAPER_TRADE else 'OFF'}: stocks, +4% / -4% bracket on every trade, "
+                 f"max ${MAX_PER_TRADE:,.0f} per trade, max {MAX_OPEN} open, cash only, "
+                 f"entries 9:45-3:30, all closed 3:55.")
         except Exception as e:
             send(f"Alpaca paper account check failed: {e}")
+        try:
+            m = screen_movers()
+            top = ", ".join(f"{x['sym']} {sign(x['chg'])}{x['chg']:.1f}%" for x in m[:8]) or "none right now"
+            send(f"Scanner OK - fast movers (> $5, up >= 3%, high volume): {top}\n(test only - no orders placed)")
+        except Exception as e:
+            send(f"Scanner check failed: {e}")
         if not CLAUDE_KEY:
             send("Claude: no ANTHROPIC_API_KEY found - 9:00 brief will run without the AI read.")
         else:
@@ -646,7 +874,15 @@ def main():
             send(f"Claude OK ({_CLAUDE_MODEL}): {ai}" if ai else "Claude check failed - see the GitHub run log.")
         return
     if mode == "report":
-        send(report_text())
+        try:
+            trades = trade_log(at(date.fromisoformat(TEST_START), 0, 0))
+        except Exception as e:
+            send(f"Paper report unavailable: {e}")
+            return
+        lines = summary_text(trades, f"PAPER since {TEST_START}") + [""] + [trade_line(t) for t in trades]
+        text = "\n".join(lines)
+        for i in range(0, len(text), 3500):
+            send(text[i:i + 3500])
         return
 
     if mode == "replay":
@@ -676,15 +912,16 @@ def main():
         if not (at(d, 7, 55) <= start <= at(d, 9, 25)):
             print("Not the morning window in New York - exiting."); return
         day = Day(d, close_t, need_premarket=True)
+        stop = min(at(d, *HANDOFF), close_t)
+        day.trader = Trader(d, close_t, at(d, 9, 0), stop)
         sleep_until(at(d, 9, 0))
         day.premarket_brief()
-        stop = min(at(d, *HANDOFF), close_t)
         run_bars(day, at(d, 9, 0), stop)
     elif mode == "afternoon":
         if not (at(d, 11, 55) <= start <= at(d, 13, 10)) or close_t <= at(d, *HANDOFF):
             print("Not the afternoon window (or early close) - exiting."); return
         day = Day(d, close_t, need_premarket=False)
-        day.in_trade = bool(spy_position())
+        day.trader = Trader(d, close_t, at(d, *HANDOFF), close_t)
         run_bars(day, at(d, *HANDOFF), close_t)
 
 
