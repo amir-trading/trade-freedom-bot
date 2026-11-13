@@ -14,8 +14,12 @@ Sends Amir live SPY alerts on Telegram, following the rules in
 Paper trading (Alpaca PAPER account, fake money) - Amir's final rules, Nov 9 2026:
   - Stocks (not SPY): fast movers, price > $5, high volume, up >= 3% on the day.
   - Setup: a 5-min candle CLOSES at a new high of the day and above VWAP.
-  - Every entry is an Alpaca BRACKET order: buy + take profit +4% + stop loss -4%.
-    Alpaca runs both exits even if the bot stops.
+  - Every entry is an Alpaca OTO order: buy + stop loss -4% (Alpaca holds the stop
+    even if the bot stops). NO fixed profit cap (changed Nov 13 2026) - the stop trails up:
+      * high reaches +2%  -> stop moves to break-even (+0.1%)
+      * high reaches +4%  -> stop trails 2.5% under the highest price since entry
+      * high reaches +8%  -> trail tightens to 2%
+    The stop only ever moves up. Winners run until the trail hits or the 3:55 close.
   - Many trades a day. After a trade closes, the same stock can be bought again
     on a new setup (a new high of the day).
   - Max $5,000 per trade, max 5 open trades, cash only (no margin), long only.
@@ -28,6 +32,7 @@ Paper trading (Alpaca PAPER account, fake money) - Amir's final rules, Nov 9 202
 RUN
   python spy_live_agent.py morning     # 8:35 ET -> 12:30 ET
   python spy_live_agent.py afternoon   # 12:25 ET -> close
+  python spy_live_agent.py safety      # ~3:20 ET -> at close-3 min closes anything still open
   python spy_live_agent.py test        # test message + Alpaca + scanner check (no orders)
   python spy_live_agent.py report      # full paper trade log + totals since the test started
   python spy_live_agent.py replay 2026-11-05   # prints a past day's SPY alerts (no Telegram)
@@ -320,8 +325,14 @@ PAPER = "https://paper-api.alpaca.markets/v2"
 PAPER_TRADE = os.getenv("PAPER_TRADE", "1") == "1"
 TEST_START = "2026-11-10"   # one-week test of the final rules starts here
 
-TAKE_PROFIT = 4.0           # % above entry
-STOP_LOSS = 4.0             # % below entry
+STOP_LOSS = 4.0             # % below entry (hard stop, held by Alpaca)
+# No take-profit cap. Trailing stop, all in % of entry / of the high since entry:
+BREAKEVEN_AT = 2.0          # high >= +2% -> stop to entry + BREAKEVEN_PLUS
+BREAKEVEN_PLUS = 0.1
+TRAIL_AT = 4.0              # high >= +4% -> stop trails TRAIL_PCT under the high
+TRAIL_PCT = 2.5
+TIGHT_AT = 8.0              # high >= +8% -> trail tightens to TIGHT_PCT
+TIGHT_PCT = 2.0
 MAX_PER_TRADE = 5000.0      # $ per trade
 MAX_OPEN = 5                # open trades at the same time
 HALF_SIZE = 0.5             # size on the day before a CPI / jobs / FOMC day
@@ -364,6 +375,10 @@ def bot_orders(after):
     return res
 
 
+OPEN_STATUSES = {"new", "accepted", "held", "pending_new", "partially_filled",
+                 "pending_replace", "replaced"}
+
+
 def trade_log(after):
     """Turns the bot's orders into trades: entry, exit, $ result."""
     orders = bot_orders(after)
@@ -378,12 +393,22 @@ def trade_log(after):
         qty = float(o["filled_qty"])
         entry = float(o["filled_avg_price"])
         t = {"cid": cid, "sym": o["symbol"], "qty": qty, "entry": entry,
-             "entry_time": to_ny(o["filled_at"]), "exit": None, "exit_time": None, "how": None}
+             "entry_time": to_ny(o["filled_at"]), "exit": None, "exit_time": None, "how": None,
+             "stop_id": None, "stop_px": None}
         for leg in o.get("legs") or []:
+            if leg.get("type") in ("stop", "stop_limit") and leg.get("status") in OPEN_STATUSES:
+                t["stop_id"] = leg["id"]
+                t["stop_px"] = float(leg.get("stop_price") or 0) or None
             if leg.get("status") == "filled":
                 t["exit"] = float(leg["filled_avg_price"])
                 t["exit_time"] = to_ny(leg["filled_at"])
-                t["how"] = "TARGET +4%" if leg.get("type") == "limit" else "STOP -4%"
+                if leg.get("type") == "limit":
+                    t["how"] = "TARGET +4%"            # old bracket orders (before Nov 13)
+                elif t["exit"] <= entry * (1 - (STOP_LOSS - 0.5) / 100):
+                    t["how"] = "STOP -4%"
+                else:
+                    t["how"] = "TRAIL STOP"
+
         x = by_cid.get(cid + "-x")
         if t["exit"] is None and x and x.get("status") == "filled":
             t["exit"] = float(x["filled_avg_price"])
@@ -487,7 +512,7 @@ def setup(sym, d, now):
 
 
 class Trader:
-    """Paper trades fast-moving stocks with +4% / -4% bracket orders.
+    """Paper trades fast-moving stocks: -4% hard stop, no profit cap, trailing stop.
     Everything is read back from Alpaca each time, so the morning and afternoon
     GitHub jobs (and a restart) all see the same trades."""
 
@@ -537,6 +562,10 @@ class Trader:
         if n >= self.flatten_at:
             self.flatten(trades)
             return
+        try:
+            self.trail_stops(trades)
+        except Exception as e:
+            print("trail error", e)
         bar_end = n.replace(second=0, microsecond=0)
         if not (self.entry_start <= bar_end <= self.entry_end):
             return
@@ -570,12 +599,10 @@ class Trader:
             qty = math.floor(size / px)
             if qty < 1:
                 break
-            tp = round(px * (1 + TAKE_PROFIT / 100), 2)
             sl = round(px * (1 - STOP_LOSS / 100), 2)
             cid = f"{TAG}-{s}-{n.strftime('%Y%m%d-%H%M')}"
             body = {"symbol": s, "qty": str(qty), "side": "buy", "type": "market",
-                    "time_in_force": "day", "order_class": "bracket",
-                    "take_profit": {"limit_price": f"{tp:.2f}"},
+                    "time_in_force": "day", "order_class": "oto",
                     "stop_loss": {"stop_price": f"{sl:.2f}"},
                     "client_order_id": cid}
             try:
@@ -587,8 +614,46 @@ class Trader:
             slots -= 1
             cash -= qty * px
             send(f"{n.strftime('%-I:%M')} PAPER BUY {qty} {s} ~{px:.2f} (${qty * px:,.0f})\n"
-                 f"Target {tp:.2f} (+4%)  Stop {sl:.2f} (-4%)\n"
+                 f"Stop {sl:.2f} (-4%). No profit cap - stop trails up as it rises.\n"
                  f"Why: up {c['chg']:.1f}% today, {why}.")
+
+    def trail_stops(self, trades):
+        """Moves each open trade's Alpaca stop up (never down):
+        -4% hard stop -> break-even at +2% -> trail 2.5% under the high at +4% -> 2% at +8%."""
+        n = now_ny()
+        for t in trades:
+            if t["exit"] is not None or not t["stop_id"] or not t["stop_px"]:
+                continue
+            e = t["entry"]
+            try:
+                b = bars(t["sym"], "1Min", t["entry_time"], n, "iex")
+                hi = max([float(x["h"]) for x in b] + [e])
+            except Exception as ex:
+                print("trail bars error", t["sym"], ex)
+                continue
+            px = last_price(t["sym"])
+            if not px:
+                continue
+            hi = max(hi, px)
+            up = pct(hi, e)
+            want = e * (1 - STOP_LOSS / 100)
+            if up >= BREAKEVEN_AT:
+                want = max(want, e * (1 + BREAKEVEN_PLUS / 100))
+            if up >= TIGHT_AT:
+                want = max(want, hi * (1 - TIGHT_PCT / 100))
+            elif up >= TRAIL_AT:
+                want = max(want, hi * (1 - TRAIL_PCT / 100))
+            want = round(min(want, px * 0.998), 2)     # a sell stop must sit under the price
+            if want < t["stop_px"] + 0.01:
+                continue
+            try:
+                paper("PATCH", f"/orders/{t['stop_id']}", json={"stop_price": f"{want:.2f}"})
+            except Exception as ex:
+                print("stop move error", t["sym"], ex)
+                continue
+            lock = (want - e) * t["qty"]
+            send(f"{n.strftime('%-I:%M')} PAPER {t['sym']} stop moved up {t['stop_px']:.2f} -> {want:.2f} "
+                 f"(high +{up:.1f}%, locks {money(lock)})")
 
     def flatten(self, trades):
         """3:55 - close everything. No overnight holds."""
@@ -720,7 +785,7 @@ class Day:
         if ai:
             lines.append("\nClaude read:\n" + ai)
         if self.trader and PAPER_TRADE:
-            lines.append("\nPaper trading today: stocks, +4% / -4% brackets, "
+            lines.append("\nPaper trading today: stocks, -4% stop + trailing stop (no profit cap), "
                          f"${self.trader.size:,.0f} per trade, max {MAX_OPEN} open, entries 9:45-3:30.")
             lines += self.trader.note
         send("\n".join(lines))
@@ -856,7 +921,7 @@ def main():
         try:
             a = paper("GET", "/account")
             send(f"Alpaca paper account OK. Equity ${float(a['equity']):,.2f}, cash ${float(a['cash']):,.2f}. "
-                 f"Paper trading {'ON' if PAPER_TRADE else 'OFF'}: stocks, +4% / -4% bracket on every trade, "
+                 f"Paper trading {'ON' if PAPER_TRADE else 'OFF'}: stocks, -4% stop + trailing stop (no profit cap), "
                  f"max ${MAX_PER_TRADE:,.0f} per trade, max {MAX_OPEN} open, cash only, "
                  f"entries 9:45-3:30, all closed 3:55.")
         except Exception as e:
@@ -909,7 +974,8 @@ def main():
 
     if mode == "morning":
         # GitHub runs this at two UTC times (EST + EDT); only the one landing 7:55-9:25 ET works.
-        if not (at(d, 7, 55) <= start <= at(d, 9, 25)):
+        # GitHub cron can start late, so a late start still runs (just without the 9:00 brief timing).
+        if not (at(d, 7, 55) <= start <= at(d, 11, 30)):
             print("Not the morning window in New York - exiting."); return
         day = Day(d, close_t, need_premarket=True)
         stop = min(at(d, *HANDOFF), close_t)
@@ -918,11 +984,27 @@ def main():
         day.premarket_brief()
         run_bars(day, at(d, 9, 0), stop)
     elif mode == "afternoon":
-        if not (at(d, 11, 55) <= start <= at(d, 13, 10)) or close_t <= at(d, *HANDOFF):
+        if not (at(d, 11, 55) <= start <= close_t - timedelta(minutes=10)) or close_t <= at(d, *HANDOFF):
             print("Not the afternoon window (or early close) - exiting."); return
         day = Day(d, close_t, need_premarket=False)
         day.trader = Trader(d, close_t, at(d, *HANDOFF), close_t)
         run_bars(day, at(d, *HANDOFF), close_t)
+    elif mode == "safety":
+        # Backup for a missed / late afternoon job: nothing is ever held overnight.
+        if start >= close_t - timedelta(minutes=2):
+            print("Too late for the safety close - exiting."); return
+        sleep_until(close_t - timedelta(minutes=3))
+        try:
+            left = paper("GET", "/positions") or []
+            if left:
+                paper("DELETE", "/positions", params={"cancel_orders": "true"})
+                syms = ", ".join(p["symbol"] for p in left)
+                send(f"{(close_t - timedelta(minutes=3)).strftime('%-I:%M')} PAPER SAFETY CLOSE - "
+                     f"still open near the close, closed now: {syms}")
+            else:
+                print("Safety check: nothing open.")
+        except Exception as e:
+            send(f"PAPER safety close failed: {e} - check Alpaca.")
 
 
 if __name__ == "__main__":
