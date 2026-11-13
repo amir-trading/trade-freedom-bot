@@ -656,33 +656,61 @@ class Trader:
                  f"(high +{up:.1f}%, locks {money(lock)})")
 
     def flatten(self, trades):
-        """3:55 - close everything. No overnight holds."""
+        """3:55 - close everything. No overnight holds.
+        Nov 13 fix: cancelling the stop orders takes a few seconds; selling before they are
+        gone failed with 'insufficient qty' and the whole close-all stopped (Nov 12 overnight hold).
+        Now: cancel, wait until no open orders, sell each trade on its own, then a final
+        close-all with retries for anything left."""
         if self.flattened:
             return
         self.flattened = True
         tm = now_ny().strftime("%-I:%M")
+        problems = []
         try:
-            paper("DELETE", "/orders")      # cancels the bracket legs still waiting
-            time.sleep(3)
-            for t in trades:
-                if t["exit"] is not None:
-                    continue
+            paper("DELETE", "/orders")      # cancels the stop legs still waiting
+        except Exception as e:
+            problems.append(f"cancel: {e}")
+        for _ in range(15):                 # up to ~30 s for the cancels to finish
+            time.sleep(2)
+            try:
+                if not (paper("GET", "/orders", params={"status": "open", "limit": 500}) or []):
+                    break
+            except Exception as e:
+                print("open orders check error", e)
+        for t in trades:
+            if t["exit"] is not None:
+                continue
+            try:
                 p = paper("GET", f"/positions/{t['sym']}")
                 if not p:
                     continue
                 qty = min(float(p["qty"]), t["qty"])
-                cid = t["cid"]
                 paper("POST", "/orders", json={"symbol": t["sym"], "qty": str(int(qty)),
                                                "side": "sell", "type": "market",
                                                "time_in_force": "day",
-                                               "client_order_id": cid + "-x"})
+                                               "client_order_id": t["cid"] + "-x"})
+            except Exception as e:
+                problems.append(f"{t['sym']}: {e}")
+        left = []
+        for _ in range(3):
             time.sleep(5)
-            left = paper("GET", "/positions") or []
-            if left:
+            try:
+                left = paper("GET", "/positions") or []
+                if not left:
+                    break
                 paper("DELETE", "/positions", params={"cancel_orders": "true"})
-            send(f"{tm} PAPER - closing everything for the day (no overnight holds).")
-        except Exception as e:
-            send(f"{tm} PAPER close-all failed: {e} - check Alpaca.")
+            except Exception as e:
+                problems.append(f"close-all: {e}")
+        if left:
+            try:
+                left = paper("GET", "/positions") or []
+            except Exception:
+                pass
+        if left:
+            send(f"{tm} PAPER close-all: STILL OPEN {', '.join(p['symbol'] for p in left)} - check Alpaca. "
+                 + " | ".join(str(x)[:120] for x in problems))
+        else:
+            send(f"{tm} PAPER - closed everything for the day (no overnight holds).")
 
     def day_summary(self):
         time.sleep(20)
@@ -994,17 +1022,29 @@ def main():
         if start >= close_t - timedelta(minutes=2):
             print("Too late for the safety close - exiting."); return
         sleep_until(close_t - timedelta(minutes=3))
-        try:
-            left = paper("GET", "/positions") or []
-            if left:
+        first, err = None, ""
+        for _ in range(4):
+            try:
+                left = paper("GET", "/positions") or []
+                if first is None:
+                    first = [p["symbol"] for p in left]
+                if not left:
+                    break
                 paper("DELETE", "/positions", params={"cancel_orders": "true"})
-                syms = ", ".join(p["symbol"] for p in left)
-                send(f"{(close_t - timedelta(minutes=3)).strftime('%-I:%M')} PAPER SAFETY CLOSE - "
-                     f"still open near the close, closed now: {syms}")
-            else:
-                print("Safety check: nothing open.")
-        except Exception as e:
-            send(f"PAPER safety close failed: {e} - check Alpaca.")
+            except Exception as e:
+                err = str(e)[:150]
+            time.sleep(8)
+        try:
+            still = [p["symbol"] for p in (paper("GET", "/positions") or [])]
+        except Exception:
+            still = ["unknown"]
+        tm = (close_t - timedelta(minutes=3)).strftime('%-I:%M')
+        if still:
+            send(f"{tm} PAPER SAFETY CLOSE FAILED - still open: {', '.join(still)} {err} - check Alpaca.")
+        elif first:
+            send(f"{tm} PAPER SAFETY CLOSE - still open near the close, closed now: {', '.join(first)}")
+        else:
+            print("Safety check: nothing open.")
 
 
 if __name__ == "__main__":
