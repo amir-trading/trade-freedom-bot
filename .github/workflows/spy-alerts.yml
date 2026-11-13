@@ -8,10 +8,12 @@ on:
     - cron: "20 13 * * 1-5"   # morning (8:20 ET in winter)
     - cron: "5 16 * * 1-5"    # afternoon (12:05 ET in summer)
     - cron: "5 17 * * 1-5"    # afternoon (12:05 ET in winter)
+    - cron: "20 19 * * 1-5"   # safety close (3:20 ET in summer)
+    - cron: "20 20 * * 1-5"   # safety close (3:20 ET in winter)
   workflow_dispatch:
     inputs:
       mode:
-        description: "test / morning / afternoon"
+        description: "test / morning / afternoon / safety / report"
         default: "test"
 
 jobs:
@@ -19,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 340
     concurrency:
-      group: spy-${{ github.event.schedule == '5 16 * * 1-5' && 'pm' || github.event.schedule == '5 17 * * 1-5' && 'pm' || 'am' }}
+      group: spy-${{ (github.event.schedule == '20 19 * * 1-5' || github.event.schedule == '20 20 * * 1-5') && 'safety' || github.event.schedule == '5 16 * * 1-5' && 'pm' || github.event.schedule == '5 17 * * 1-5' && 'pm' || 'am' }}
       cancel-in-progress: false
     env:
       TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
@@ -38,6 +40,7 @@ jobs:
         id: m
         run: |
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then echo "mode=${{ inputs.mode }}" >> $GITHUB_OUTPUT;
+          elif [[ "${{ github.event.schedule }}" == "20 19 * * 1-5" || "${{ github.event.schedule }}" == "20 20 * * 1-5" ]]; then echo "mode=safety" >> $GITHUB_OUTPUT;
           elif [[ "${{ github.event.schedule }}" == 5\ 1* ]]; then echo "mode=afternoon" >> $GITHUB_OUTPUT;
           else echo "mode=morning" >> $GITHUB_OUTPUT; fi
       - run: python -u spy_live_agent.py ${{ steps.m.outputs.mode }}
