@@ -30,6 +30,9 @@ jobs:
       ALPACA_SECRET_KEY: ${{ secrets.ALPACA_SECRET_KEY }}
       FRED_API_KEY: ${{ secrets.FRED_API_KEY }}
       ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }} 
+      SCHWAB_APP_KEY: ${{ secrets.SCHWAB_APP_KEY }}
+      SCHWAB_APP_SECRET: ${{ secrets.SCHWAB_APP_SECRET }}
+      SCHWAB_TOKEN: ${{ secrets.SCHWAB_TOKEN }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
