@@ -51,6 +51,12 @@ from zoneinfo import ZoneInfo
 
 import requests
 
+try:
+    import schwab_data as schwab       # extra data source (Schwab) - falls back to Alpaca
+except Exception as _e:
+    print("schwab_data not loaded:", _e)
+    schwab = None
+
 NY = ZoneInfo("America/New_York")
 
 
@@ -175,6 +181,18 @@ def alpaca_get(path, params):
 
 
 def bars(sym, tf, start, end, feed):
+    """Schwab first (real-time, all exchanges); Alpaca if Schwab is off or fails."""
+    if schwab and schwab.ready():
+        try:
+            b = schwab.bars(sym, tf, start, end)
+            if b:
+                return b
+        except Exception as e:
+            print("schwab bars error, using Alpaca:", sym, tf, e)
+    return alpaca_bars(sym, tf, start, end, feed)
+
+
+def alpaca_bars(sym, tf, start, end, feed):
     out, params = [], {"timeframe": tf, "start": start.isoformat(), "end": end.isoformat(),
                        "limit": 10000, "feed": feed, "adjustment": "raw"}
     while True:
@@ -235,8 +253,13 @@ def daily_history(d):
 
 
 def last_price(sym):
-    """Latest pre-market price: IEX live trade if it's from today, else SIP bars (15 min delayed)."""
+    """Latest price: Schwab live quote first, else IEX live trade from today, else SIP bars (15 min delayed)."""
     n = now_ny()
+    if schwab and schwab.ready():
+        try:
+            return schwab.last_price(sym)
+        except Exception as e:
+            print("schwab quote error, using Alpaca:", sym, e)
     try:
         j = alpaca_get(f"/stocks/{sym}/snapshot", {"feed": "iex"})
         tr = j["latestTrade"]
@@ -253,6 +276,11 @@ def last_price(sym):
 
 
 def vix_change():
+    if schwab and schwab.ready():
+        try:
+            return schwab.vix_change()
+        except Exception as e:
+            print("schwab VIX error, using Yahoo:", e)
     try:
         import yfinance as yf
         h = yf.Ticker("^VIX").history(period="5d", interval="1d")
@@ -978,6 +1006,7 @@ def main():
             send(f"Scanner OK - fast movers (> $5, up >= 3%, high volume): {top}\n(test only - no orders placed)")
         except Exception as e:
             send(f"Scanner check failed: {e}")
+        send(schwab.status() if schwab else "Schwab data: module missing (using Alpaca).")
         if not CLAUDE_KEY:
             send("Claude: no ANTHROPIC_API_KEY found - 9:00 brief will run without the AI read.")
         else:
