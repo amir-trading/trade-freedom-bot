@@ -443,10 +443,32 @@ def trade_log(after):
             t["exit"] = float(x["filled_avg_price"])
             t["exit_time"] = to_ny(x["filled_at"])
             t["how"] = "3:55 CLOSE"
-        if t["exit"] is not None:
-            t["pnl"] = (t["exit"] - entry) * qty
-            t["win"] = t["pnl"] > 0
         trades.append(t)
+
+    # Report fix (Nov 16): exits made by Alpaca's close-all / the safety close have no bot tag.
+    # Match each still-open trade to the first later filled SELL of the same stock.
+    used = set()
+    loose = [o for o in orders
+             if o.get("side") == "sell" and o.get("status") == "filled"
+             and not (o.get("client_order_id") or "").startswith(TAG + "-")]
+    for t in sorted(trades, key=lambda x: x["entry_time"]):
+        if t["exit"] is not None:
+            continue
+        for o in loose:
+            if o["id"] in used or o["symbol"] != t["sym"] or not o.get("filled_at"):
+                continue
+            if to_ny(o["filled_at"]) < t["entry_time"]:
+                continue
+            used.add(o["id"])
+            t["exit"] = float(o["filled_avg_price"])
+            t["exit_time"] = to_ny(o["filled_at"])
+            t["how"] = "CLOSE-ALL"
+            break
+
+    for t in trades:
+        if t["exit"] is not None:
+            t["pnl"] = (t["exit"] - t["entry"]) * t["qty"]
+            t["win"] = t["pnl"] > 0
     return trades
 
 
